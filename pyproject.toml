@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shield-learning"
+version = "0.1.0"
+description = "A Gymnasium goal-selection adapter for the existing SHIELD simulator"
+requires-python = ">=3.10"
+dependencies = ["gymnasium>=1.0,<2", "numpy>=1.24,<3"]
+
+[tool.setuptools]
+packages = ["shield_learning"]

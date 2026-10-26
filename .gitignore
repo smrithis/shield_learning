@@ -1,0 +1,24 @@
+# Environments and caches
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Native build output (rebuild with scripts/build_native.sh)
+build/
+
+# Generated results; regenerate with the scripts in scripts/.
+# source_hashes_before.json is an input manifest read by baseline.py.
+results/*
+!results/source_hashes_before.json
+
+# Large or raw artifacts
+*.bag
+*.bag.active
+*.npz
+*.npy
+*.pkl
+*.so
+*.pdf
