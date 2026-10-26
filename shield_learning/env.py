@@ -31,7 +31,10 @@ class ShieldInterceptionEnv(gym.Env):
 
     def __init__(self, *, substeps=10, max_ticks=500, success_reward=10.0,
                  motion_weight=0.01, switch_weight=0.01, timeout=120.0,
-                 goal_mask_fk_error_m=0.05, apply_goal_mask=True):
+                 goal_mask_fk_error_m=0.05, apply_goal_mask=True, perception="oracle",
+                 original_runtime=False, planning_latency=True, perception_scale=1.0,
+                 perception_outliers=True, perception_dropouts=True, perception_latency=True,
+                 exposure_offset_s=0.0):
         for name, value in (("substeps", substeps), ("max_ticks", max_ticks)):
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -43,7 +46,14 @@ class ShieldInterceptionEnv(gym.Env):
         self.config = dict(substeps=int(substeps), max_ticks=int(max_ticks),
                            success_reward=float(success_reward), motion_weight=float(motion_weight),
                            switch_weight=float(switch_weight),
-                           goal_mask_fk_error_m=float(goal_mask_fk_error_m), apply_goal_mask=bool(apply_goal_mask))
+                           goal_mask_fk_error_m=float(goal_mask_fk_error_m), apply_goal_mask=bool(apply_goal_mask),
+                           perception=str(perception), original_runtime=bool(original_runtime),
+                           planning_latency=bool(planning_latency), perception_scale=float(perception_scale),
+                           perception_outliers=bool(perception_outliers),
+                           perception_dropouts=bool(perception_dropouts),
+                           perception_latency=bool(perception_latency), exposure_offset_s=float(exposure_offset_s))
+        if perception not in ("oracle", "timed_truth", "calibrated"):
+            raise ValueError("perception must be oracle, timed_truth or calibrated")
         self.timeout = timeout
         self.render_mode = None
         self._done = True
@@ -63,6 +73,7 @@ class ShieldInterceptionEnv(gym.Env):
             self.observation_space = spaces.Dict({
                 key: spaces.Box(-np.inf, np.inf, shape=shape, dtype=np.float64)
                 for key, shape in {"projectile_mean": (6,), "projectile_covariance": (6, 6),
+                                   "belief_valid": (1,), "belief_age_s": (1,),
                                    "joint_position": (6,), "joint_velocity": (6,)}.items()})
         except BaseException:
             self.close()
@@ -132,6 +143,10 @@ class ShieldInterceptionEnv(gym.Env):
     def episode_diagnostics(self):
         """Ball plane crossing, selected goal, arm state and failure cause of the last episode."""
         return self._request("episode_diagnostics")
+
+    def perception_trace(self):
+        """Separate truth, measurement and belief streams of the last episode (diagnostics only)."""
+        return self._request("perception_trace")
 
     def baseline_action(self):
         """Existing planner's direct-goal scoring within this action space."""

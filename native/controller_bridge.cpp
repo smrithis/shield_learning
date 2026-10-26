@@ -34,12 +34,16 @@ void shield_command(void* ptr, const double* q, const double* v,
     c.core.applyPlannerCommand(cmd, c.input);
 }
 
+// measured_q == nullptr runs the cycle open-loop on Ruckig's own state, as
+// controller.cpp does between its every-15-cycle joint-state updates.
 int shield_tick(void* ptr, const double* measured_q, double* velocity) {
     try {
         auto& c = *static_cast<Controller*>(ptr);
-        shield_controller::RobotJointState state;
-        std::copy_n(measured_q, 6, state.position.begin());
-        c.core.applyRobotJointState(state, c.input);
+        if (measured_q) {
+            shield_controller::RobotJointState state;
+            std::copy_n(measured_q, 6, state.position.begin());
+            c.core.applyRobotJointState(state, c.input);
+        }
         const auto result = c.core.update(c.input, c.output);
         if (static_cast<int>(result) < 0) return static_cast<int>(result);
         const auto command = c.core.makeOutput(c.output, result);

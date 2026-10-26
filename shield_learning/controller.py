@@ -16,9 +16,10 @@ class Controller:
         self.lib.shield_create.restype = ctypes.c_void_p
         self.lib.shield_destroy.argtypes = [ctypes.c_void_p]
         self.lib.shield_command.argtypes = [ctypes.c_void_p, vector, vector, vector, ctypes.c_double]
-        self.lib.shield_tick.argtypes = [ctypes.c_void_p, vector, vector]
+        self.lib.shield_tick.argtypes = [ctypes.c_void_p, ctypes.c_void_p, vector]
         self.lib.shield_tick.restype = ctypes.c_int
         self.ptr = self.lib.shield_create(np.ascontiguousarray(q, dtype=np.float64))
+        self.last_result = None  # ruckig::Result of the latest tick (0 Working, 1 Finished)
         if not self.ptr:
             raise RuntimeError("Could not construct ExistingRuckigController")
 
@@ -30,12 +31,15 @@ class Controller:
                                 float(result.duration))
 
     def tick(self, q):
+        """One 4 ms cycle; q=None runs open-loop on Ruckig's own state (no measurement)."""
         velocity = np.zeros(6, dtype=np.float64)
-        result = self.lib.shield_tick(self.ptr, np.ascontiguousarray(q, dtype=np.float64), velocity)
+        measured = None if q is None else np.ascontiguousarray(q, dtype=np.float64)
+        result = self.lib.shield_tick(self.ptr, None if measured is None else measured.ctypes.data, velocity)
         if result < 0:
             raise RuntimeError(f"ExistingRuckigController returned error {result}")
         if not np.isfinite(velocity).all():
             raise RuntimeError("Non-finite controller output")
+        self.last_result = int(result)
         return velocity
 
     def close(self):

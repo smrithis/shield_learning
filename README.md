@@ -251,6 +251,94 @@ clip bound, and none are in model contact.
   selectable Gym actions, and the planner scores them by their intended [Y, Z].
 - The 4 non-goal tree nodes have no task position, so this check does not apply to them.
 
+## Perception uncertainty and the original runtime
+
+Ground truth, measurements and beliefs are now kept separate. Everything new is
+off by default (`perception="oracle"`, `original_runtime=False`), so earlier results
+and tests are unchanged.
+
+```bash
+bash scripts/run_ros_module.sh perception_calibration   # bags -> shield_learning/data/perception_calibration.json
+bash scripts/run_ros_module.sh perception_validation    # synthetic vs real flights
+bash scripts/run_ros_module.sh runtime_validation       # recorded beliefs+requests -> planner replay
+bash scripts/run_paired_evaluation.sh                   # arms A-D, 105 throws, 5 seeds (~12 min)
+```
+
+**Estimator.** The perception pipeline reuses the existing SlidingKalman reconstruction
+(`riae_replay_validation_2026-10-05/probe.py`) unchanged, and wraps it in a replica of
+the node's frame loop:
+- a buffer of at most 10 detections;
+- estimates only once 4 are buffered;
+- the buffer is cleared after 5 unusable frames;
+- a belief is published only when |vx| > 2 m/s.
+
+On exp_TD bags 015–021, the replica reproduces all **397/397** recorded estimates (max
+error 5.8e-12) and matches the publication gate in every case.
+
+**Calibration from bags 015–021.** There is no independent truth in the bags. Each
+throw's reference is a RANSAC fit with gravity only (to pick the clean samples),
+refitted with free constant acceleration so that drag is not mistaken for sensor
+noise. That gives 134 measurements in the clean throw spans:
+
+| Disturbance | Model (data-selected) |
+|---|---|
+| Inlier noise | constant σ along the camera ray: 29 mm depth, 7 / 15 mm lateral. Range scaling fit worse. |
+| Outliers | ~25 % of measurements, bursty Markov (0.20 / 0.44), resampled from 34 measured residuals (0.08–1.9 m) |
+| Frames | 10 ms grid; acceptance Markov 0.54 / 0.41; 90 % of missing frames count toward the 5-frame reset (fitted to the real restart rate) |
+| Visibility | starts at the real track start (3.1–4.5 m from the camera); ends at base x 1.1–1.8 m |
+| Latency | stamp → receipt, from 42+ recorded beliefs (~10 ms median) |
+| Planner timing | per-request queueing delay from 1,178 in-flight round trips (11.7 % ~100 ms) |
+
+**Fidelity checks.**
+- *Replaying the real flights* through the generator (200 seeds each) against the
+  recordings:
+  - measurements 27 vs 29, published beliefs 21 vs 24, valid crossing predictions 19 vs 18;
+  - restarts 0.57 vs 0.57, belief jumps over 0.5 m 3.5 vs 2.4;
+  - median crossing error 12 / 16 / 28 cm (synthetic) vs 8 / 18 / 36 cm (real) at
+    0.1–0.2 / 0.2–0.3 / 0.3–0.6 s before crossing.
+- *Planner timing.* Replaying every recorded belief and request through the planner
+  reproduces **8,971/8,976** request outcomes and 58/59 targets exactly when `plan()`
+  runs at the end of the round trip. Planning at request time reproduces only 8,940.
+- *Controller schedule.* Ruckig now receives measured joints every 15 cycles, as
+  `controller.cpp` does. The old every-tick update stalls retargeting to tree nodes
+  that have a nonzero target velocity. This fix rebuilt the bridge, adding a nullable
+  `measured_q` argument.
+
+**Paired results** (original planner, 5 cm mask, identical throws; arms B–D share
+request-delay draws, and C/D share the whole perception stream per seed):
+
+| Arm (87 in-coverage throws) | Success | 95 % CI |
+|---|---:|---|
+| A oracle beliefs, ideal timing | 88.5 % | 80–94 % |
+| B oracle beliefs, original runtime | 73.3 % | 69–77 % |
+| C exact state at calibrated publication times/latency | 42.8 % | 38–48 % |
+| D calibrated measurements → SlidingKalman | **32.2 %** | 28–37 % |
+
+- The gap from A to D is **56 points**, broken down as:
+  - runtime timing, A→B: −15;
+  - when information arrives (visibility, filter warm-up, latency), B→C: −31;
+  - estimation error (noise, outliers, restarts), C→D: −11.
+- In D, the dominant failure cause is that the arm has not arrived when the ball crosses
+  (229); wrong goal selection is second (55).
+- In D, the sampled check and the 40 µs swept check agree on 105/105 episodes.
+- **The throw set is harder than exp_TD.** Replaying the 7 real throws gives arm D
+  87/140 hits, or 80/100 excluding two throws broken by missing drag. The real robot hit
+  5 of these 7 throws, and 81 % of all labelled trials. The simulator is calibrated in
+  aggregate, not per throw: real miss 017 is hit in 18/20 simulated seeds.
+
+**Fidelity limits.**
+- The simulated projectile has **no drag**. That moves the crossing up to 0.36 m higher
+  on 2 of 7 real throws.
+- The reference trajectory is a fit, not truth; there is one session, one camera and 7 throws.
+- The exposure-to-stamp offset cannot be identified and defaults to 0.
+- The per-cycle trajectory collision check, the home sequence and the 2 s abort are not
+  modelled.
+- Arm tracking is kinematic.
+
+See `docs/SEQUENTIAL_DECISIONS.md` for how the original system decides and what a
+sequential RL interface still needs (decision points, HOLD action, timing parity,
+controller state, post-`Finished` mask).
+
 ## Goal mask and diverse-throw evaluation
 
 `shield_learning/scenarios.py` defines each throw by **where it crosses the

@@ -218,9 +218,53 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(diagnostics['failure_cause'], 'outside_goal_coverage')
         self.assertGreater(self.env.swept_check(20)['swept_min_surface_distance_m'], 0)
 
+    def test_perception_streams_are_separate_and_paired(self):
+        throw = {'x0': 4.0, 'y0': 0.0, 'z0': 1.1, 'speed': 6.5, 'launch_angle_deg': 8.0, 'side_angle_deg': 0.0}
+        traces = {}
+        for mode in ('timed_truth', 'calibrated'):
+            env = ShieldInterceptionEnv(perception=mode, original_runtime=True, substeps=1, max_ticks=400)
+            try:
+                obs, info = env.reset(seed=5, options={'randomize': False, 'throw': throw})
+                self.assertEqual(obs['belief_valid'][0], 0.)  # nothing published at reset
+                np.testing.assert_array_equal(obs['projectile_mean'], np.zeros(6))
+                self.assertEqual(len(info['privileged_true_projectile_state']), 6)
+                while True:
+                    obs, _, terminated, truncated, info = env.step_planner()
+                    if terminated or truncated:
+                        break
+                traces[mode] = env.perception_trace()
+                self.assertGreater(info['runtime']['plan_requests'], 0)
+                obs_again, _ = env.reset(seed=5, options={'randomize': False, 'throw': throw})
+                again = env.perception_trace()
+                self.assertEqual(len(again['measurements']), len(traces[mode]['measurements']))
+            finally:
+                env.close()
+        a, b = traces['timed_truth'], traces['calibrated']
+        self.assertGreater(len(b['measurements']), 4)
+        # Same seed -> identical perception stream in both modes (paired comparison).
+        self.assertEqual([m['stamp_s'] for m in a['measurements']], [m['stamp_s'] for m in b['measurements']])
+        self.assertEqual([x['available_s'] for x in a['beliefs']], [x['available_s'] for x in b['beliefs']])
+        for m in b['measurements']:  # measurements keep their own truth sample, separate from beliefs
+            self.assertEqual(len(m['true_position']), 3)
+        for x in b['beliefs']:
+            self.assertGreaterEqual(x['available_s'], x['stamp_s'])
+            self.assertTrue(x['published'] == (abs(x['mu'][3]) > 2.0))
+
+    def test_calibration_and_runtime_validation_artifacts(self):
+        import json
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        cal = json.loads((root / 'shield_learning/data/perception_calibration.json').read_text())
+        self.assertEqual(len(cal['source']['bag_sha256']), 7)
+        self.assertEqual(cal['num_frame'], 4)
+        self.assertEqual(cal['inlier_noise']['model'], 'constant')
+        self.assertTrue(0 < cal['outlier_markov']['after_inlier'] < 1)
+        self.assertGreater(len(cal['planning_round_trip_s']['request_during_flight']), 1000)
+
     def test_constructor_validation(self):
         for config in [{'substeps': 0}, {'max_ticks': 1.5}, {'motion_weight': -1}, {'timeout': float('nan')},
-                       {'goal_mask_fk_error_m': 0.0}, {'goal_mask_fk_error_m': float('inf')}]:
+                       {'goal_mask_fk_error_m': 0.0}, {'goal_mask_fk_error_m': float('inf')},
+                       {'perception': 'noisy'}]:
             with self.assertRaises(ValueError):
                 ShieldInterceptionEnv(**config)
 

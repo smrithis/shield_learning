@@ -10,6 +10,7 @@ import numpy as np
 
 from .controller import Controller
 from .frames import SweptChecker, UrdfShield, ik_world_from_plane, plane_frame_evaluator
+from .perception import MeasurementGenerator
 from .runtime import LocalRuntime, load_simulator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,8 @@ from std_msgs.msg import Float64MultiArray
 
 
 GRAVITY = 9.81
+PERCEPTION_MODES = ("oracle", "timed_truth", "calibrated")
+RUCKIG_FINISHED = 1
 # Box half-width plus ball radius: a ball centre this far (max |dY|,|dZ|) from the shield
 # centre in the plane can still overlap a plane-aligned shield. Diagnostic only.
 CAPTURE_HALF_WIDTH = 0.17 + 0.0381
@@ -75,6 +78,9 @@ class Backend:
             np.asarray(n.full_6dof_config))[0] - np.r_[0., n.task_position])) for n in self.planner.goal_nodes]
         self.swept = SweptChecker(self.runtime.params["~model_path"], self.evaluator.ball_radius)
         self.launch_time = 0.0
+        self.planning_pools = json.loads(
+            (ROOT / "shield_learning/data/perception_calibration.json").read_text())["planning_round_trip_s"]
+        self.perception = "oracle"
         self.flagged_nodes = set()
         self.mask_threshold = 0.05
         self.valid = np.ones(len(self.goal_fk_error), dtype=bool)
@@ -160,22 +166,124 @@ class Backend:
         self.goal_switches = 0
         self.command_count = 0
         self.commands = []
+        self._reset_perception(int(seed))
         self.initial_mean = self.observation()["projectile_mean"].copy()
         info = self.info()
         info["action_mask"] = self.valid.tolist()
         return {"observation": self.observation(), "info": info}
+
+    def _reset_perception(self, seed):
+        """Ground truth stays in `ball_state`; beliefs come from the configured perception."""
+        cfg = self.config
+        self.perception = cfg.get("perception", "oracle")
+        if self.perception not in PERCEPTION_MODES:
+            raise ValueError(f"perception must be one of {PERCEPTION_MODES}")
+        self.original_runtime = bool(cfg.get("original_runtime", False))
+        self.trace = None
+        self.belief_queue, self.queue_index, self.latest_belief = [], 0, None
+        if self.perception != "oracle":
+            options = {k: cfg[f"perception_{k}"] for k in ("scale", "outliers", "dropouts", "latency")
+                       if f"perception_{k}" in cfg}
+            generator = MeasurementGenerator(exposure_offset_s=float(cfg.get("exposure_offset_s", 0.0)), **options)
+            truth = lambda t: (np.asarray(self.ball_state(t)[:3]), np.asarray(self.ball_state(t)[3:]))
+            self.trace = generator.episode(truth, self.max_ticks * self.dt + 0.05,
+                                           np.random.default_rng([seed, 1]))
+            for belief in self.trace["beliefs"]:
+                belief["true_state"] = np.asarray(self.ball_state(belief["stamp_s"] - generator.exposure_offset))
+            self.belief_queue = [b for b in self.trace["beliefs"] if b["published"]]
+        # Request-loop state of controller.cpp (used when original_runtime is on).
+        rng = np.random.default_rng([seed, 2])
+        pools = self.planning_pools
+        latency = bool(cfg.get("planning_latency", True)) and self.original_runtime
+        # Per-request queueing delay before plan() runs (runtime_validation: 8971/8976 outcomes).
+        self.plan_latencies = rng.choice(pools["request_during_flight"], 4096).tolist() if latency else [0.0] * 4096
+        self.rt = {"pending": None, "next_request": 0, "executing": False, "exec_start": None,
+                   "finished": None, "wait": True, "successes": 0, "requests": 0, "ignored": 0,
+                   "cycle": 0, "measure": True}
+
+    def _deliver_beliefs(self):
+        """Hand beliefs whose receipt time has passed to the planner, as projectile_callback does."""
+        if self.perception == "oracle":
+            return
+        while self.queue_index < len(self.belief_queue) and \
+                self.belief_queue[self.queue_index]["available_s"] <= self.elapsed + 1e-12:
+            belief = self.belief_queue[self.queue_index]
+            self.queue_index += 1
+            mean = belief["true_state"] if self.perception == "timed_truth" else belief["mu"]
+            self.latest_belief = (belief, np.asarray(mean))
+            self.planner.update_belief(ProjectileBelief(np.asarray(mean), np.asarray(belief["P"]), belief["stamp_s"]))
+
+    def _command(self, result):
+        """Send a planner/goal result to the controller unless the original gates forbid it."""
+        if self.original_runtime and self.rt["finished"] is not None:
+            self.rt["ignored"] += 1  # controller.cpp: execution ended, stop then home; no retarget.
+            return 0
+        switched = 0
+        if result.selected_node_index != self.last_command_node:
+            switched = int(self.last_command_node is not None)
+            self.controller.command(result)
+            self.last_command_node = int(result.selected_node_index)
+            self.command_count += 1
+            self.goal_switches += switched
+            self.commands.append((self.ticks, self.last_command_node))
+        if not self.rt["executing"]:
+            self.rt["executing"], self.rt["exec_start"] = True, self.ticks
+        self.rt["wait"] = bool(result.wait)
+        self.rt["measure"] = True  # controller.cpp calls updateState before applying a new goal
+        return switched
+
+    def _runtime_tick(self):
+        """One 4 ms cycle of controller.cpp's request loop (idle loop and executeTrajectory).
+
+        A request carries cur_time from when it is sent; the action server runs plan()
+        after the sampled queueing delay, on the latest belief at that moment, and the
+        result is applied on arrival. The next request goes out on the following cycle.
+        """
+        rt, k = self.rt, self.ticks
+        switched = 0
+        if rt["pending"] is not None:
+            due, cur_time = rt["pending"]
+            if k < due:
+                return switched
+            rt["pending"] = None
+            result = self.planner.plan(cur_time)  # consumes the latest belief, as the action server does
+            if result is not None:
+                rt["successes"] += 1
+                switched = self._command(result)
+            rt["next_request"] = k + 1
+            return switched
+        if rt["finished"] is not None or k < rt["next_request"]:
+            return switched
+        if rt["executing"] and rt["wait"]:
+            # shouldRequestReplan: tree (wait) results replan only near the first-3-joint target.
+            target = np.asarray(self.planner.graph[self.last_command_node].position[:3])
+            if np.linalg.norm(target - np.asarray(self.arm.positions[:3])) >= 0.1:
+                return switched
+        cur_time = (k - rt["exec_start"]) * self.dt if rt["executing"] else 0.0
+        delay = int(np.ceil(self.plan_latencies[rt["requests"] % len(self.plan_latencies)] / self.dt - 1e-9))
+        rt["requests"] += 1
+        rt["pending"] = (k + delay, cur_time)
+        return self._runtime_tick() if delay == 0 else switched
 
     @property
     def elapsed(self):
         return self.ticks * self.dt
 
     def observation(self):
-        state = self.ball_state(self.elapsed)
-        msg = self.projectile.projectile_message(state, self.runtime.Time.now())
-        return {"projectile_mean": np.asarray(msg.mu, dtype=np.float64),
-                "projectile_covariance": np.asarray(msg.P, dtype=np.float64).reshape(6, 6),
-                "joint_position": np.asarray(self.arm.positions, dtype=np.float64),
-                "joint_velocity": np.asarray(self.arm.velocities, dtype=np.float64)}
+        joints = {"joint_position": np.asarray(self.arm.positions, dtype=np.float64),
+                  "joint_velocity": np.asarray(self.arm.velocities, dtype=np.float64)}
+        if getattr(self, "perception", "oracle") == "oracle":
+            state = self.ball_state(self.elapsed)
+            msg = self.projectile.projectile_message(state, self.runtime.Time.now())
+            return {"projectile_mean": np.asarray(msg.mu, dtype=np.float64),
+                    "projectile_covariance": np.asarray(msg.P, dtype=np.float64).reshape(6, 6),
+                    "belief_valid": np.ones(1), "belief_age_s": np.zeros(1), **joints}
+        if self.latest_belief is None:  # nothing published yet: explicit flag, no invented state
+            return {"projectile_mean": np.zeros(6), "projectile_covariance": np.zeros((6, 6)),
+                    "belief_valid": np.zeros(1), "belief_age_s": np.zeros(1), **joints}
+        belief, mean = self.latest_belief
+        return {"projectile_mean": mean.astype(np.float64), "projectile_covariance": np.asarray(belief["P"]),
+                "belief_valid": np.ones(1), "belief_age_s": np.array([self.elapsed - belief["stamp_s"]]), **joints}
 
     def surface_distance(self):
         ball = np.asarray(self.ball_state(self.elapsed)[:3])
@@ -194,6 +302,10 @@ class Backend:
                 if self.last_goal_node() is not None else None,
                 "selected_goal_flagged": self.last_goal_node() in self.flagged_nodes,
                 "goal_mask_applied": bool(not self.valid.all()),
+                "perception": getattr(self, "perception", "oracle"),
+                "original_runtime": bool(getattr(self, "original_runtime", False)),
+                # Privileged: for diagnostics/teachers only, never part of the observation.
+                "privileged_true_projectile_state": np.asarray(self.ball_state(self.elapsed)),
                 "observation_frame": "odom_combined", "reward_is_physical_contact": False}
 
     def last_goal_node(self):
@@ -202,6 +314,9 @@ class Backend:
         return goals[-1] if goals else None
 
     def _update_belief(self):
+        if self.perception != "oracle":
+            self._deliver_beliefs()
+            return
         obs = self.observation()
         self.planner.update_belief(ProjectileBelief(obs["projectile_mean"],
                                                    obs["projectile_covariance"], self.elapsed))
@@ -227,8 +342,9 @@ class Backend:
     def step(self, action=None, planner=False, hold=False):
         if self.done:
             raise RuntimeError("Episode has ended; call reset()")
-        if hold:
-            result = None  # Baseline helper: no valid prediction yet, keep the current command.
+        runtime_loop = planner and self.original_runtime
+        if hold or runtime_loop:
+            result = None  # hold: no valid prediction yet; runtime loop: decided per tick below
         elif planner:
             self._update_belief()
             result = self.planner.plan(self.elapsed)
@@ -241,13 +357,8 @@ class Backend:
             result = self.goal_result(action)
             self.last_goal_action = action
         switched = 0
-        if result is not None and result.selected_node_index != self.last_command_node:
-            switched = int(self.last_command_node is not None)
-            self.controller.command(result)
-            self.last_command_node = int(result.selected_node_index)
-            self.command_count += 1
-            self.goal_switches += switched
-            self.commands.append((self.ticks, self.last_command_node))
+        if result is not None:
+            switched = self._command(result)
         motion = 0.0
         reason = None
         for _ in range(self.substeps):
@@ -255,8 +366,26 @@ class Backend:
             if self.min_surface <= 0:
                 reason = "interception"
                 break
+            if runtime_loop:
+                if self.perception == "oracle":
+                    self._update_belief()  # oracle: a fresh exact belief every 4 ms cycle
+                else:
+                    self._deliver_beliefs()
+                switched += self._runtime_tick()
+            elif self.perception != "oracle":
+                self._deliver_beliefs()
             q_before = np.asarray(self.arm.positions)
-            velocity = self.controller.tick(q_before)
+            measured = q_before
+            if self.original_runtime and self.rt["executing"]:
+                # executeTrajectory feeds measured joints to Ruckig only every 15 cycles (and
+                # on a new goal); other cycles run open-loop on Ruckig's own state.
+                measured = q_before if self.rt["measure"] or self.rt["cycle"] % 15 == 0 else None
+                self.rt["measure"] = False
+                self.rt["cycle"] += 1
+            velocity = self.controller.tick(measured)
+            if self.original_runtime and self.rt["executing"] and self.rt["finished"] is None \
+                    and self.controller.last_result == RUCKIG_FINISHED:
+                self.rt["finished"] = self.ticks
             self.arm.command_callback(Float64MultiArray(data=velocity.tolist()))
             self.runtime.tick(self.arm.dt)
             self.ticks += 1
@@ -287,6 +416,13 @@ class Backend:
         info = self.info(reason)
         info["reward_terms"] = terms
         info["policy_interface"] = "hold" if hold else "ExistingBeliefPlanner.plan" if planner else "discrete_goal"
+        if self.original_runtime:
+            info["runtime"] = {"plan_requests": self.rt["requests"], "plan_successes": self.rt["successes"],
+                               "ignored_after_finish": self.rt["ignored"],
+                               "finished_s": None if self.rt["finished"] is None else self.rt["finished"] * self.dt,
+                               # controller.cpp would start goHome 1 s after finishing; not modelled.
+                               "home_sequence_due": self.rt["finished"] is not None
+                               and self.elapsed - self.rt["finished"] * self.dt > 1.0}
         return {"observation": self.observation(), "reward": sum(terms.values()),
                 "terminated": terminated, "truncated": truncated, "info": info}
 
@@ -304,6 +440,31 @@ class Backend:
             reached = error[-1] < tolerance_rad
             times.append(float((outside[-1] + 1) * self.dt) if reached and len(outside) else 0.0 if reached else None)
         return times
+
+    def perception_trace(self):
+        """Separate streams for the last episode: truth, measurements, beliefs (all published flags)."""
+        if self.trace is None:
+            return {"perception": self.perception, "measurements": [], "beliefs": []}
+        R, t = self.planner.R, self.planner.t
+        x0, vx = R[:, 0] @ (np.asarray(self.ball_state(0.0)[:3]) - t), R[:, 0] @ np.asarray(self.ball_state(0.0)[3:])
+        crossing_time = -x0 / vx if vx else None
+        true_crossing = (R.T @ (np.asarray(self.ball_state(crossing_time)[:3]) - t))[1:] if crossing_time else None
+        from belief3d_live import propagate_until
+        beliefs = []
+        for b in self.trace["beliefs"]:
+            row = {k: b[k] for k in ("stamp_s", "available_s", "published")}
+            row.update(mu=b["mu"], P=b["P"], true_state=b["true_state"],
+                       position_error_m=float(np.linalg.norm(b["mu"][:3] - b["true_state"][:3])),
+                       velocity_error_m_s=float(np.linalg.norm(b["mu"][3:] - b["true_state"][3:])))
+            if true_crossing is not None and b["published"] and b["stamp_s"] <= crossing_time:
+                o, _, _ = propagate_until(b["mu"], b["P"], stop_x=0.0, R_bp=R, t_bp=t)
+                row["time_to_crossing_s"] = crossing_time - b["stamp_s"]
+                row["crossing_error_m"] = None if o is None else float(np.linalg.norm(np.asarray(o).ravel()[:2] - true_crossing))
+            beliefs.append(row)
+        return {"perception": self.perception, "frames": len(self.trace["frames"]),
+                "visible_frames": sum(f["visible"] for f in self.trace["frames"]),
+                "resets": self.trace["resets"], "true_crossing_time_s": crossing_time,
+                "measurements": self.trace["measurements"], "beliefs": beliefs}
 
     def episode_diagnostics(self):
         """Analytic plane crossing of the ball and why the episode did or did not intercept.
@@ -625,7 +786,8 @@ def main():
                 request = json.loads(line)
                 op = request.pop("op")
                 if op not in {"metadata", "reset", "step", "baseline_action", "verify",
-                              "swept_check", "controlled_interception", "episode_diagnostics"}:
+                              "swept_check", "controlled_interception", "episode_diagnostics",
+                              "perception_trace"}:
                     raise ValueError(f"Unknown operation: {op}")
                 with contextlib.redirect_stdout(sys.stderr):
                     result = getattr(backend, op)(**request)
