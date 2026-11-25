@@ -24,7 +24,7 @@ from .perception import CALIBRATION, PROBE, WS, SlidingKalmanNode, load_sliding,
 
 ROOT = CALIBRATION.parents[2]
 RIAE = WS / "analysis/2026-10/riae_replay_validation_2026-10-05"
-BAGS = WS / "exp_TD/bags"
+BAGS = WS / "analysis/data/exp_TD/bags"
 TRIALS = ["success_015", "success_016", "miss_017", "success_018", "miss_019", "success_020", "success_021"]
 G = np.array([0.0, 0.0, -9.81])
 INLIER_M = 0.08          # residual threshold separating inliers from outliers
