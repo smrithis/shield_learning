@@ -18,8 +18,8 @@
    "success_020": "2da5ee82e50526440d690fee0acc9784c650435f8f12e60492edb11dfe19c4a9",
    "success_021": "5202164a13b923607479f6949eec063a1594b45d34c24c4bc5528d2e9bf56168"
   },
-  "estimator_reconstruction": "/home/shield/code/smrithi_ws/riae_replay_validation_2026-10-05/probe.py",
-  "flight_windows": "/home/shield/code/smrithi_ws/riae_replay_validation_2026-10-05",
+  "estimator_reconstruction": "/home/shield/code/smrithi_ws/analysis/2026-10/riae_replay_validation_2026-10-05/probe.py",
+  "flight_windows": "/home/shield/code/smrithi_ws/analysis/2026-10/riae_replay_validation_2026-10-05",
   "reference": "RANSAC gravity-only ballistic fit; not independent truth",
   "inlier_threshold_m": 0.08,
   "seed": 20261025

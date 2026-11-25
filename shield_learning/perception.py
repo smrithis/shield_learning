@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 WS = Path(os.environ.get("SHIELD_WS", "/home/shield/code/smrithi_ws")).resolve()
-PROBE = WS / "riae_replay_validation_2026-10-05/probe.py"
+PROBE = WS / "analysis/2026-10/riae_replay_validation_2026-10-05/probe.py"
 CALIBRATION = Path(__file__).resolve().parent / "data/perception_calibration.json"
 GRAVITY = np.array([0.0, 0.0, -9.81])
 # Node constants (track_ball_meancovariance_node.cpp).

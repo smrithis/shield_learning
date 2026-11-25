@@ -2,7 +2,7 @@
 
 There is no independent projectile truth in the bags. Each throw's reference is
 found inside the flight window already established by
-riae_replay_validation_2026-10-05: RANSAC with a gravity-only ballistic model
+analysis/2026-10/riae_replay_validation_2026-10-05: RANSAC with a gravity-only ballistic model
 selects inliers, then a constant-acceleration fit on those inliers absorbs drag
 (the simulated projectile has none), so drag curvature is not counted as sensor
 noise. Residuals to that reference define inlier noise and outliers; it is a
@@ -23,7 +23,7 @@ import rosbag
 from .perception import CALIBRATION, PROBE, WS, SlidingKalmanNode, load_sliding, ray_basis
 
 ROOT = CALIBRATION.parents[2]
-RIAE = WS / "riae_replay_validation_2026-10-05"
+RIAE = WS / "analysis/2026-10/riae_replay_validation_2026-10-05"
 BAGS = WS / "exp_TD/bags"
 TRIALS = ["success_015", "success_016", "miss_017", "success_018", "miss_019", "success_020", "success_021"]
 G = np.array([0.0, 0.0, -9.81])

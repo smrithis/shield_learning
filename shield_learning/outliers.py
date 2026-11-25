@@ -13,7 +13,7 @@ import numpy as np
 
 from .backend import PLANNER_DIR, ROOT, WS
 
-PRIOR_STUDY = WS / "stored_goal_outliers_2026-10-04/bad_goals.csv"
+PRIOR_STUDY = WS / "analysis/2026-10/stored_goal_outliers_2026-10-04/bad_goals.csv"
 THRESHOLDS = (1e-3, 1e-2, 5e-2, 1e-1)
 
 

@@ -236,7 +236,7 @@ this verifies the geometry and timing pipeline, not planner skill.
 
 `results/goal_outliers.{json,csv}` lists every goal over 1 mm, with a
 cross-reference to the per-goal classification in
-`smrithi_ws/stored_goal_outliers_2026-10-04`. All 18 goals from that study are
+`smrithi_ws/analysis/2026-10/stored_goal_outliers_2026-10-04`. All 18 goals from that study are
 reproduced. Of the 34 goals over 1 mm, 28 have a joint exactly at a `run_IK.py`
 clip bound, and none are in model contact.
 
@@ -265,7 +265,7 @@ bash scripts/run_paired_evaluation.sh                   # arms A-D, 105 throws, 
 ```
 
 **Estimator.** The perception pipeline reuses the existing SlidingKalman reconstruction
-(`riae_replay_validation_2026-10-05/probe.py`) unchanged, and wraps it in a replica of
+(`analysis/2026-10/riae_replay_validation_2026-10-05/probe.py`) unchanged, and wraps it in a replica of
 the node's frame loop:
 - a buffer of at most 10 detections;
 - estimates only once 4 are buffered;
